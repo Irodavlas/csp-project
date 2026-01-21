@@ -1,0 +1,102 @@
+create user
+sudo adduser --disabled-password --gecos "" serveruser
+
+
+Server (root, outside chroot)
+│
+├─ create_user <username> <perm>  --> adduser + mkdir + chown + chmod
+│
+└─ Fork session for user:
+       chroot(server_root)
+       chdir(user_home)
+       setuid(user_uid)
+       setgid(user_gid)
+       Serve requests (read/write confined, list respects perms)
+
+SIGN UP 
+client ── SIGNUP alice ──▶ server (unprivileged)
+                                │
+                                ├─ validate username strictly
+                                ├─ rate‑limit
+                                ├─ check existence
+                                └─ send fixed request
+                                    ──▶ helper (root)
+                                             create system user
+                                             create home dir
+                                             set ownership
+
+LOGIN
+client ── LOGIN alice ──▶ server (unprivileged)
+                              │
+                              ├─ authenticate
+                              └─ fork()
+                                   └─ child:
+                                        seteuid(0)
+                                        chroot(/srv/vmroot)
+                                        chdir(/users/alice)
+                                        setuid(uid_alice)
+                                        handleClient()
+
+1. Main server process
+
+Started as root (or via sudo) if system users are required.
+
+Immediately:
+
+Starts privileged helper (keeps root)
+
+Drops privileges permanently to serveruser (setuid(serveruser))
+
+Listens for connections (accept()) on a socket.
+
+Forks on each client connection for parallel handling.
+
+2. Privileged helper (root forever)
+
+Handles only system-wide, dangerous operations:
+
+Create system users
+
+Create home directories
+
+Set ownership (chown)
+
+Receives structured requests from main server (not raw client input)
+
+Serializes operations to avoid race conditions.
+NEEDS A MUTEX
+Never parses untrusted input from the network.
+
+Returns simple success/failure to the main server.
+
+3. Client connection handling (forked child)
+
+Each client connection is handled in a forked child of the main server.
+
+Parses client requests (SIGNUP or LOGIN).
+
+SIGNUP flow:
+
+Validate username strictly (regex + length)
+
+Send request to helper to create the user
+
+Respond to client based on helper result
+
+Does NOT chroot, does NOT gain root
+
+LOGIN flow:
+
+Authenticate user
+
+Fork again if needed for session
+
+Temporarily regain root (seteuid(0)) only to:
+
+chroot("/srv/vmroot")
+
+chdir("/users/<username>")
+
+Permanently drop root with setuid(uid) for the user
+
+Handle client session fully unprivileged and jailed
