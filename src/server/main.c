@@ -8,9 +8,10 @@
 
 #include <fcntl.h>
 
-#include "server.h"
-#include "helper.h"
-#include "utils.h"
+#include "server/server.h"
+#include "helper/helper.h"
+#include "utils/utils.h"
+#include "net/net.h"
 
 #define DEFAULT_IP "127.0.0.1"
 #define DEFAULT_PORT 8080
@@ -18,6 +19,9 @@
 
 #define PATH_MAX 512
 #define SOCKT_MAX 128
+
+SharedRegistry* registry = NULL;
+
 
 int main(int argc, char* argv[]) {
     if (argc < 2 || argv[1][0] == '\0'){
@@ -83,6 +87,10 @@ int main(int argc, char* argv[]) {
     }
         */
     // create the helper
+
+    SharedMemCleanup(); // for safety force clean up in case mem persisted
+    initSharedRegistry();
+
     Helper* helper = CreateHelper(listen_fd, root_dir);   
     
 
