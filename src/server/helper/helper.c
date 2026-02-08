@@ -263,7 +263,7 @@ int CreateSystemUser(
         releaseUserCreationLock(lock_fd);
         return -1;
     }
-
+    
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork");
@@ -278,7 +278,7 @@ int CreateSystemUser(
             "adduser",
             "--disabled-password",
             "--gecos", "",
-            "--ingroup", "userGroup",
+            "--ingroup", "users",
             "--home", homeDir,
             "--no-create-home",
             username,
