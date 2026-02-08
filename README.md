@@ -13,12 +13,12 @@
 ## 3. How to execute commands and expected outputs
 
 ### create_user <username> <permissions (octal)>
-Input: create_user user 0740
-Expected output: User created succesfully
+$ Input: create_user user 0740
+$ Expected output: User created succesfully
 
 ### login <username>
-Input: login user
-Expected output: Login successful
+$ Input: login user
+& Expected output: Login successful
 
 ### create <path> <permissions (in octal)> [-d] 
 Input: create file.txt 0740 | create dir 0740 -d
