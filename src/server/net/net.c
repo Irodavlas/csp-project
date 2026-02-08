@@ -1,12 +1,15 @@
 
 
 #include <stdio.h>        // perror, snprintf
-#include <string.h>       // memset, strncpy
+#include <string.h>       // memset, strncpy, strlen
 #include <unistd.h>       // close, unlink, chown
-#include <sys/types.h>    // gid_t
-#include <sys/socket.h>   // socket, bind, connect, listen
-#include <sys/un.h>       // sockaddr_un
-#include <sys/stat.h>     // chmod
+#include <fcntl.h>        // fcntl, F_SETLKW 
+#include <sys/types.h>    
+#include <sys/socket.h>   
+#include <sys/un.h>       
+#include <sys/stat.h>
+
+#include "net/net.h"
 
 #define HELPER_SOCK_REL "/tmp/helper.sock"
 
@@ -72,4 +75,128 @@ int connectToHelper() {
     }
 
     return fd; 
+}
+
+int sendProtocolMsgLocked(int fd, msg_type type, uint32_t status, const char* msg, int is_bg) {
+    int ret = -1;
+    if (acquire_socket_lock(fd) == 0) {
+        ret = sendProtocolMsgBg(fd, type, status, msg, is_bg);
+        release_socket_lock(fd);
+    }
+    return ret;
+}
+int sendProtocolMsgBg(int fd, msg_type type, uint32_t status, const char* msg, int is_bg) {
+    msg_header resp;
+    resp.type = type;
+    resp.status = status;
+    resp.is_background = (uint8_t)is_bg;
+    resp.payloadLength = (uint32_t)strlen(msg) + 1; 
+
+    if (writeAll(fd, &resp, sizeof(resp)) < 0) return -1;
+    return writeAll(fd, msg, resp.payloadLength);
+}
+
+int sendHelperRequestRW(int helper_fd,
+                        helper_commands cmd,
+                        int argc,
+                        char *argv[],
+                        int offset,
+                        ClientSession *session,
+                        void *data,
+                        uint32_t data_len,
+                        helper_response *out)
+{
+    uint32_t p_len = 0;
+    for (int i = 0; i < argc; i++)
+        p_len += strlen(argv[i]) + 1;
+
+    helper_request_header req_hdr = {
+        .cmd = cmd,
+        .argc = argc,
+        .payload_len = p_len,
+        .offset = offset,
+        .data_len = data_len
+    };
+
+    if (session) req_hdr.session = *session;
+
+    if (writeAll(helper_fd, &req_hdr, sizeof(req_hdr)) < 0) return -1;
+
+    for (int i = 0; i < argc; i++)
+        if (writeAll(helper_fd, argv[i], strlen(argv[i]) + 1) < 0)
+            return -1;
+
+    if (data_len > 0 && data) {
+        if (writeAll(helper_fd, data, data_len) < 0)
+            return -1;
+    }
+    if (readAll(helper_fd, out, sizeof(helper_response)) <= 0)
+        return -1;
+
+    return out->status;
+}
+
+int sendHelperRequest(int helper_fd, helper_commands cmd, int argc, char *argv[], ClientSession *session, helper_response *out) {
+    uint32_t p_len = 0;
+    for (int i = 0; i < argc; i++) {
+        p_len += strlen(argv[i]) + 1;
+    }
+
+    helper_request_header req_hdr = {
+        .cmd = cmd,
+        .argc = argc,
+        .payload_len = p_len,
+        .offset = 0,
+    };
+    if (session) req_hdr.session = *session;
+
+    if (writeAll(helper_fd, &req_hdr, sizeof(req_hdr)) < 0) return -1;
+
+    for (int i = 0; i < argc; i++) {
+        if (writeAll(helper_fd, argv[i], strlen(argv[i]) + 1) < 0) return -1;
+    }
+    if (readAll(helper_fd, out, sizeof(helper_response)) <= 0) return -1;
+
+    return out->status;
+}
+
+
+int sendProtocolMsg(int fd, msg_type type, uint32_t status, const char* msg) {
+    msg_header resp;
+    resp.type = type;
+    resp.status = status;
+    resp.is_background = 0;
+    resp.payloadLength = strlen(msg) + 1; 
+
+    if (writeAll(fd, &resp, sizeof(resp)) < 0) return -1;
+    if (resp.payloadLength > 0) {
+        if (writeAll(fd, msg, resp.payloadLength) < 0) return -1;
+    }
+    return 0;
+}
+int acquire_socket_lock(int fd) {
+    struct flock fl = {
+        .l_type = F_WRLCK,
+        .l_whence = SEEK_SET,
+        .l_start = 0,
+        .l_len = 0
+    };
+    if (fcntl(fd, F_SETLKW, &fl) == -1) {
+        perror("acquire_socket_lock");
+        return -1;
+    }
+    return 0;
+}
+int release_socket_lock(int fd) {
+    struct flock fl = {
+        .l_type = F_UNLCK,
+        .l_whence = SEEK_SET,
+        .l_start = 0,
+        .l_len = 0
+    };
+    if (fcntl(fd, F_SETLK, &fl) == -1) {
+        perror("release_socket_lock");
+        return -1;
+    }
+    return 0;
 }

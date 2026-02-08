@@ -1,6 +1,7 @@
 // handles each call such as LOGIN, LS etc as routes
-#include "server/server.h"
-#include "utils/utils.h"
+#include "core/server.h"
+#include "net/net.h"
+
 #ifndef HANDLER_H
 #define HANDLER_H
 
@@ -10,10 +11,9 @@ typedef struct {
     ClientState state;
     uid_t uid;
     gid_t gid;
-    char username[32];
+    char username[MAX_USERNAME_LEN];
     char home[ABS_PATH];
     char workdir[ABS_PATH]; //relative to home path 
-    // other infos obtained after login 
 } ClientSession;
 
 

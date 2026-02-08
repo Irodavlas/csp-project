@@ -20,6 +20,7 @@
 #include <sys/mman.h>
 
 #include "helper/helper.h"
+#include "net/net.h"
 #include "utils/utils.h"
 
 #define USER_CREATION_LOCK_FILENAME ".user_creation.lock"
@@ -28,40 +29,6 @@ static char lock_file_path[PATH_MAX];
 
 typedef void (*cmd_func) (int server_fds, int argc, char* argv[]);
 
-int acquireUserCreationLock() {
-    int fd = open(lock_file_path, O_RDWR);
-    if (fd < 0) {
-        perror("open lock file");
-        return -1;
-    }
-    
-    struct flock fl;
-    fl.l_type = F_WRLCK;
-    fl.l_whence = SEEK_SET;
-    fl.l_start = 0;
-    fl.l_len = 0;
-    
-    if (fcntl(fd, F_SETLKW, &fl) < 0) {
-        perror("fcntl lock");
-        close(fd);
-        return -1;
-    }
-    
-    return fd;
-}
-
-void releaseUserCreationLock(int fd) {
-    if (fd < 0) return;
-    
-    struct flock fl;
-    fl.l_type = F_UNLCK;
-    fl.l_whence = SEEK_SET;
-    fl.l_start = 0;
-    fl.l_len = 0;
-    
-    fcntl(fd, F_SETLK, &fl);
-    close(fd);
-}
 
 void initSharedRegistry() {
     int fd = shm_open("/server_registry", O_CREAT | O_RDWR, 0660);
@@ -89,7 +56,23 @@ void initSharedRegistry() {
 }
 
 void SharedMemCleanup() {
-    shm_unlink("/server_registry");
+   if (registry != NULL) {
+        sem_destroy(&registry->mux);
+    }
+    if (shm_unlink("/server_registry") == -1) {
+        if (errno != ENOENT) {
+            perror("[Cleanup] shm_unlink failed");
+        }
+    } else {
+        printf("[Cleanup] Shared memory /server_registry unlinked.\n");
+    }
+    
+    if (lock_file_path[0] != '\0') {
+        unlink(lock_file_path);
+        printf("[Cleanup] User creation lock file removed.\n");
+    }
+    unlink("/tmp/helper.sock");
+    
 }
 
 Helper* CreateHelper(int socket_fd, char* rootDir) {
@@ -102,16 +85,10 @@ Helper* CreateHelper(int socket_fd, char* rootDir) {
     }
     strncpy(helper->rootDir, absRoot, sizeof(helper->rootDir)-1);
     helper->rootDir[sizeof(helper->rootDir)-1] = '\0';
-
-
-
     return helper;
 }
 
 void runHelperLoop(Helper* helper) {
-
-
-
     snprintf(lock_file_path, sizeof(lock_file_path), 
              "%s/%s", helper->rootDir, USER_CREATION_LOCK_FILENAME);
     
@@ -262,85 +239,6 @@ void handleCommands(Helper* helper, int server_fds){
     }
 }
 
-int dropPrivilegesTemp(ClientSession *cs) {
-    if (getuid() != 0) {
-        fprintf(stderr, "Not running as root, cannot drop privileges\n");
-        return -1;
-    }
-    //   The  initgroups() function initializes the group access list by reading
-    //   the group database /etc/group and using all groups of which user  is  a
-    //   member
-    // to avoid having other groups bypassing our permission checks
-    if (initgroups(cs->username, cs->gid) != 0) {
-        perror("initgroups");
-        return -1;
-    }
-
-    if (setegid(cs->gid) != 0) {
-        perror("setegid");
-        return -1;
-    }
-
-    if (seteuid(cs->uid) != 0) {
-        perror("seteuid");
-        return -1;
-    }
-
-    printf("Privileges temporarily dropped to user: %s\n", cs->username);
-    return 0;
-}
-
-int regainRoot() {
-    if (seteuid(0) != 0 || setegid(0) != 0) {
-        perror("Failed to regain root");
-        return -1;
-    }
-
-    printf("Privileges regained as root\n");
-    return 0;
-}
-
-int sandboxUserToHisHome(const ClientSession* session){
-    printf("Session home:%s\n", session->home);
-    if (chroot(session->home) == -1) {
-        perror("chroot");
-        return -1;
-    }
-    if (chdir(session->workdir) == -1) {
-        perror("chdir");
-        return -1;
-    }
-    if (dropPrivilegesTemp(session) == -1) {
-        return -1;
-    }
-    return 0;
-}
-int sandboxUserToRoot(const ClientSession* session, char* rootdir){
-    if (chroot(rootdir) == -1) {
-        perror("chroot");
-        return -1;
-    }
-    char realPath[2056];
-    printf("workdir:%s\n", session->workdir);
-   
-    snprintf(realPath, sizeof(realPath), "/%s%s", session->username, session->workdir);
-    printf("real path:%s\n", realPath);
-    
-    if (chdir(realPath) == -1) {
-        perror("chdir");
-        return -1;
-    }
-    if (dropPrivilegesTemp(session) == -1) {
-        return -1;
-    }
-    return 0;
-}
-int userExists(const char *username) {
-    struct passwd *pw = getpwnam(username);
-    return pw != NULL;
-}
-
-
 
 
 int CreateSystemUser(
@@ -354,7 +252,7 @@ int CreateSystemUser(
     char homeDir[ABS_PATH];
     snprintf(homeDir, sizeof(homeDir), "%s/%s", rootDir, username);
 
-    int lock_fd = acquireUserCreationLock();
+    int lock_fd = acquireUserCreationLock(lock_file_path);
     if (lock_fd < 0) {
         snprintf(msg, msgLen, "internal server error");
         return -1;
@@ -666,41 +564,46 @@ out:
 
 void HandleHelperDelete(int server_fd, helper_request_header *hdr, const char* path, helper_response *res) {
     int lockFd = -1;
+    struct stat st;
+
     if (sandboxUserToHisHome(&hdr->session) == -1) {
         strncpy(res->msg, "Sandbox error", sizeof(res->msg) - 1);
         writeAll(server_fd, res, sizeof(helper_response));
         _exit(1);
     }
-    lockFd = lock_file(path, LOCK_EXCLUSIVE);
-    if (lockFd < 0) {
-        snprintf(res->msg, sizeof(res->msg), "Cannot lock file for delete");
-        goto out;
-    }
-    struct stat st;
     if (stat(path, &st) != 0) {
         snprintf(res->msg, sizeof(res->msg), "Delete failed: %s", strerror(errno));
         goto out;
     }
-    
+
     int ret = -1;
-    // only works if dir is empty
     if (S_ISDIR(st.st_mode)) {
+        // only works if the directory is EMPTY
         ret = rmdir(path); 
         if (ret != 0) {
             snprintf(res->msg, sizeof(res->msg), "Delete directory failed: %s", strerror(errno));
             goto out;
         }
     } else {
+        lockFd = lock_file(path, LOCK_EXCLUSIVE);
+        if (lockFd < 0) {
+            snprintf(res->msg, sizeof(res->msg), "Cannot lock file for delete");
+            goto out;
+        }
+
         ret = unlink(path);
         if (ret != 0) {
             snprintf(res->msg, sizeof(res->msg), "Delete file failed: %s", strerror(errno));
             goto out;
         }
+        
+        unlock_file(lockFd);
+        lockFd = -1; 
     }
-    unlock_file(lockFd);
 
     res->status = 0;
     snprintf(res->msg, sizeof(res->msg), "Deleted successfully");
+
 out: 
     if (lockFd >= 0) {
         unlock_file(lockFd);
@@ -709,9 +612,7 @@ out:
         _exit(1);   
     }
     writeAll(server_fd, res, sizeof(helper_response));
-
 }
-
 void HandleHelperMove(int server_fd, helper_request_header *hdr, const char* path1, const char* path2, helper_response *res) {
     int lockFd = -1;
     if (sandboxUserToHisHome(&hdr->session) == -1) {

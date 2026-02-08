@@ -3,95 +3,20 @@
 
 // TCP streams read and writes must be handled with care
 // https://incoherency.co.uk/blog/stories/reading-tcp-sockets.html
-#include "utils/utils.h"
-#include "common/utility.h"
-#include <unistd.h>
-#include <stdio.h>
+
+#include "net/net.h"
+#include "utils/utils.h"    
+
+#include <grp.h>            // Required for initgroups()
+#include <fcntl.h>          // Required for open(), fcntl(), and F_WRLCK
+#include <stdlib.h>         // Required for strtol() 
+#include <limits.h>         // Required for PATH_MAX 
 #include <errno.h>
-#include <string.h>
-#include <sys/file.h>
-#include <sys/socket.h>
-#include <sys/un.h>
 #include <sys/stat.h>
-#include <stdbool.h> 
-#include <ctype.h>
+#include <string.h>  // For strlen
+#include <ctype.h>   // For isalpha
+#include <unistd.h>  // For chown, chroot, chdir, getuid, seteuid, close
 
-#include <stdint.h>
-
-
-
-int lock_file(const char *path, LockType type) {
-    int flags = (type == LOCK_EXCLUSIVE) ? O_RDWR : O_RDONLY;
-    int fd = open(path, flags);
-    if (fd < 0) {
-        perror("open for locking");
-        return -1;
-    }
-
-    struct flock fl;
-    fl.l_start = 0;
-    fl.l_len = 0; 
-    fl.l_whence = SEEK_SET;
-
-    if (type == LOCK_EXCLUSIVE) {
-        fl.l_type = F_WRLCK;
-    } else {
-        fl.l_type = F_RDLCK;
-    }
-
-    if (fcntl(fd, F_SETLKW, &fl) < 0) { 
-        perror("fcntl lock");
-        close(fd);
-        return -1;
-    }
-
-    return fd; 
-}
-
-void unlock_file(int fd) {
-    if (fd < 0) return;
-
-    struct flock fl;
-    fl.l_type = F_UNLCK;
-    fl.l_whence = SEEK_SET;
-    fl.l_start = 0;
-    fl.l_len = 0;
-
-    fcntl(fd, F_SETLK, &fl);
-    close(fd);
-}
-int lock_fd(int fd, LockType type) {
-    if (fd < 0) return -1;
-
-    struct flock fl;
-    fl.l_start = 0;
-    fl.l_len = 0;       // 0 means lock the entire file
-    fl.l_whence = SEEK_SET;
-    fl.l_type = (type == LOCK_EXCLUSIVE) ? F_WRLCK : F_RDLCK;
-
-    if (fcntl(fd, F_SETLKW, &fl) < 0) {
-        perror("fcntl lock_fd");
-        return -1;
-    }
-
-    return 0; 
-}
-int unlock_fd(int fd) {
-    if (fd < 0) return -1;
-
-    struct flock fl;
-    fl.l_type = F_UNLCK; 
-    fl.l_whence = SEEK_SET;
-    fl.l_start = 0;
-    fl.l_len = 0;
-
-    if (fcntl(fd, F_SETLK, &fl) < 0) {
-        perror("fcntl unlock_fd");
-        return -1;
-    }
-
-    return 0;
-}
 
 bool isUsernameValid(char* username) {
     if (!username) {
@@ -145,128 +70,112 @@ int createUserDirectory(const char* pathname, uid_t uid, gid_t gid, mode_t mode)
     return 0;
 }
 
-
-int sendProtocolMsg(int fd, msg_type type, uint32_t status, const char* msg) {
-    msg_header resp;
-    resp.type = type;
-    resp.status = status;
-    resp.is_background = 0;
-    resp.payloadLength = strlen(msg) + 1; 
-
-    if (writeAll(fd, &resp, sizeof(resp)) < 0) return -1;
-    if (resp.payloadLength > 0) {
-        if (writeAll(fd, msg, resp.payloadLength) < 0) return -1;
+int dropPrivilegesTemp(const ClientSession *cs) {
+    if (getuid() != 0) {
+        fprintf(stderr, "Not running as root, cannot drop privileges\n");
+        return -1;
     }
+    //   The  initgroups() function initializes the group access list by reading
+    //   the group database /etc/group and using all groups of which user  is  a
+    //   member
+    // to avoid having other groups bypassing our permission checks
+    if (initgroups(cs->username, cs->gid) != 0) {
+        perror("initgroups");
+        return -1;
+    }
+
+    if (setegid(cs->gid) != 0) {
+        perror("setegid");
+        return -1;
+    }
+
+    if (seteuid(cs->uid) != 0) {
+        perror("seteuid");
+        return -1;
+    }
+
+    printf("Privileges temporarily dropped to user: %s\n", cs->username);
     return 0;
 }
-int sendHelperRequest(int helper_fd, helper_commands cmd, int argc, char *argv[], ClientSession *session, helper_response *out) {
-    uint32_t p_len = 0;
-    for (int i = 0; i < argc; i++) {
-        p_len += strlen(argv[i]) + 1;
-    }
 
-    helper_request_header req_hdr = {
-        .cmd = cmd,
-        .argc = argc,
-        .payload_len = p_len,
-        .offset = 0,
-    };
-    if (session) req_hdr.session = *session;
-
-    if (writeAll(helper_fd, &req_hdr, sizeof(req_hdr)) < 0) return -1;
-
-    for (int i = 0; i < argc; i++) {
-        if (writeAll(helper_fd, argv[i], strlen(argv[i]) + 1) < 0) return -1;
-    }
-    if (readAll(helper_fd, out, sizeof(helper_response)) <= 0) return -1;
-
-    return out->status;
-}
-
-int sendHelperRequestRW(int helper_fd,
-                        helper_commands cmd,
-                        int argc,
-                        char *argv[],
-                        int offset,
-                        ClientSession *session,
-                        void *data,
-                        uint32_t data_len,
-                        helper_response *out)
-{
-    uint32_t p_len = 0;
-    for (int i = 0; i < argc; i++)
-        p_len += strlen(argv[i]) + 1;
-
-    helper_request_header req_hdr = {
-        .cmd = cmd,
-        .argc = argc,
-        .payload_len = p_len,
-        .offset = offset,
-        .data_len = data_len
-    };
-
-    if (session) req_hdr.session = *session;
-
-    if (writeAll(helper_fd, &req_hdr, sizeof(req_hdr)) < 0) return -1;
-
-    for (int i = 0; i < argc; i++)
-        if (writeAll(helper_fd, argv[i], strlen(argv[i]) + 1) < 0)
-            return -1;
-
-    if (data_len > 0 && data) {
-        if (writeAll(helper_fd, data, data_len) < 0)
-            return -1;
-    }
-    if (readAll(helper_fd, out, sizeof(helper_response)) <= 0)
+int regainRoot() {
+    if (seteuid(0) != 0 || setegid(0) != 0) {
+        perror("Failed to regain root");
         return -1;
+    }
 
-    return out->status;
+    printf("Privileges regained as root\n");
+    return 0;
 }
 
-int sendProtocolMsgBg(int fd, msg_type type, uint32_t status, const char* msg, int is_bg) {
-    msg_header resp;
-    resp.type = type;
-    resp.status = status;
-    resp.is_background = (uint8_t)is_bg;
-    resp.payloadLength = (uint32_t)strlen(msg) + 1; 
-
-    if (writeAll(fd, &resp, sizeof(resp)) < 0) return -1;
-    return writeAll(fd, msg, resp.payloadLength);
-}
-
-
-int acquire_socket_lock(int fd) {
-    struct flock fl = {
-        .l_type = F_WRLCK,
-        .l_whence = SEEK_SET,
-        .l_start = 0,
-        .l_len = 0
-    };
-    if (fcntl(fd, F_SETLKW, &fl) == -1) {
-        perror("acquire_socket_lock");
+int sandboxUserToHisHome(const ClientSession* session){
+    printf("Session home:%s\n", session->home);
+    if (chroot(session->home) == -1) {
+        perror("chroot");
+        return -1;
+    }
+    if (chdir(session->workdir) == -1) {
+        perror("chdir");
+        return -1;
+    }
+    if (dropPrivilegesTemp(session) == -1) {
         return -1;
     }
     return 0;
 }
-int release_socket_lock(int fd) {
-    struct flock fl = {
-        .l_type = F_UNLCK,
-        .l_whence = SEEK_SET,
-        .l_start = 0,
-        .l_len = 0
-    };
-    if (fcntl(fd, F_SETLK, &fl) == -1) {
-        perror("release_socket_lock");
+int sandboxUserToRoot(const ClientSession* session, char* rootdir){
+    if (chroot(rootdir) == -1) {
+        perror("chroot");
+        return -1;
+    }
+    char realPath[2056];
+    printf("workdir:%s\n", session->workdir);
+   
+    snprintf(realPath, sizeof(realPath), "/%s%s", session->username, session->workdir);
+    printf("real path:%s\n", realPath);
+    
+    if (chdir(realPath) == -1) {
+        perror("chdir");
+        return -1;
+    }
+    if (dropPrivilegesTemp(session) == -1) {
         return -1;
     }
     return 0;
 }
 
-int sendProtocolMsgLocked(int fd, msg_type type, uint32_t status, const char* msg, int is_bg) {
-    int ret = -1;
-    if (acquire_socket_lock(fd) == 0) {
-        ret = sendProtocolMsgBg(fd, type, status, msg, is_bg);
-        release_socket_lock(fd);
+
+int acquireUserCreationLock(const char* lock_file_path) {
+    int fd = open(lock_file_path, O_RDWR);
+    if (fd < 0) {
+        perror("open lock file");
+        return -1;
     }
-    return ret;
+    
+    struct flock fl;
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start = 0;
+    fl.l_len = 0;
+    
+    if (fcntl(fd, F_SETLKW, &fl) < 0) {
+        perror("fcntl lock");
+        close(fd);
+        return -1;
+    }
+    
+    return fd;
+}
+
+void releaseUserCreationLock(int fd) {
+    if (fd < 0) return;
+    
+    struct flock fl;
+    fl.l_type = F_UNLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start = 0;
+    fl.l_len = 0;
+    
+    fcntl(fd, F_SETLK, &fl);
+    close(fd);
 }

@@ -2,10 +2,11 @@
 #define _GNU_SOURCE
 
 #include "handler/handlers.h"
-#include "utils/utils.h"
 #include "common/utility.h"
-#include "server/server.h"
+#include "core/server.h"
 #include "helper/helper.h"
+#include "utils/utils.h"
+
 
 
 #include "net/net.h"
@@ -715,7 +716,7 @@ void handleDownload(int client_sfd, int argc, char* argv[], Server* server, Clie
         sendProtocolMsgLocked(client_sfd, TEXT, 0, finished_msg, is_bg);
     } else {
         close(data_sfd);
-        char err_msg[256];
+        char err_msg[2048];
         snprintf(err_msg, sizeof(err_msg), "Download failed: %s", 
              (res.msg[0] != '\0') ? res.msg : "Helper error");
         sendProtocolMsgLocked(client_sfd, TEXT, -1, err_msg, is_bg);
@@ -786,7 +787,7 @@ void handleUpload(int client_sfd, int argc, char* argv[], Server* server, Client
         sendProtocolMsgLocked(client_sfd, TEXT, 0, finished_msg, is_bg);   
     } else {
         close(data_sfd);
-        char err_msg[256];
+        char err_msg[1500];
         snprintf(err_msg, sizeof(err_msg), "Upload failed: %s", 
              (res.msg[0] != '\0') ? res.msg : "Helper error");
         sendProtocolMsgLocked(client_sfd, TEXT, -1, err_msg, is_bg);

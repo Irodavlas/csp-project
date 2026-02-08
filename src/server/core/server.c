@@ -4,8 +4,8 @@
 #define _POSIX_C_SOURCE 200809L // needed for SA_RESTART macro and sigaction
 
 #include "handler/handlers.h"
-#include "server/server.h"
-
+#include "core/server.h"
+#include "helper/helper.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -19,6 +19,8 @@
 
 #include <arpa/inet.h> // for inet_pton
 #include <signal.h>
+
+#include <sys/select.h>
 
 #include <errno.h>
 
@@ -76,36 +78,61 @@ int startServer(Server* server) {
         close(server->sfd);
         return -1;
     }
+    sleep(1);
     printf("Server listening on %s:%d\n", server->Ip, server->Port);
-
-   
+    printf("Type 'exit' to shut down the server.\n");
     
+    fd_set read_fds;
+    int max_fds = server->sfd;
+
     while (1)
     {
-        struct sockaddr_in addr;
-        socklen_t len = sizeof(addr);
-        int client_sfd = accept(server->sfd, (struct sockaddr*)&addr, &len); // storing client info for logging
-        if (client_sfd < 0) {
-            perror("accept");
-            continue;
-        } 
-        pid_t pid = fork();
-        if (pid < 0) {
-            perror("fork");
-            close(client_sfd);
-            continue;
-        }
-        // child 
-        if (pid == 0) {
-            close(server->sfd); // close as child won't be accepting any request
-            // call handle client 
-            handleClient(client_sfd,server);
-            close(client_sfd); 
-            _exit(0); // performs no cleanup 
-        } else { 
-            // parent 
+        // macro to clear sete of fds at each iter 
+        FD_ZERO(&read_fds);
+        FD_SET(server->sfd, &read_fds); // socket
+        FD_SET(STDIN_FILENO, &read_fds); // input 
 
-            close(client_sfd); // no need here
+        if (select(max_fds + 1, &read_fds, NULL, NULL, NULL) < 0) {
+            if (errno == EINTR) continue; 
+            perror("select");
+            break;
+        }
+        if (FD_ISSET(STDIN_FILENO, &read_fds)) {
+            char buffer[256];
+            if (fgets(buffer, sizeof(buffer), stdin)) {
+                buffer[strcspn(buffer, "\n")] = 0;
+                if (strcmp(buffer, "exit") == 0) {
+                    printf("Termination command received. Shutting down...\n");
+                    break;
+                }
+            }
+        }
+        if (FD_ISSET(server->sfd, &read_fds)) {
+            struct sockaddr_in addr;
+            socklen_t len = sizeof(addr);
+            int client_sfd = accept(server->sfd, (struct sockaddr*)&addr, &len); // storing client info for logging
+            if (client_sfd < 0) {
+                if (errno != EINTR) perror("accept");
+                continue;
+            } 
+            pid_t pid = fork();
+            if (pid < 0) {
+                perror("fork");
+                close(client_sfd);
+                continue;
+            }
+            // child 
+            if (pid == 0) {
+                close(server->sfd); // close as child won't be accepting any request
+                // call handle client 
+                handleClient(client_sfd,server);
+                close(client_sfd); 
+                _exit(0); // performs no cleanup 
+            } else { 
+                // parent 
+
+                close(client_sfd); // no need here
+            }
         }
     }
     return 0;
@@ -181,4 +208,38 @@ int dropPriviledges(struct passwd* pw){
         }
     }
     return 0;
+}
+
+void performFullCleanup(Server* server, pid_t helperPid) {
+    printf("\n[Cleanup] Starting graceful shutdown...\n");
+
+    if (helperPid > 0) {
+        printf("[Cleanup] Terminating Helper (PID: %d)...\n", helperPid);
+        kill(helperPid, SIGTERM); 
+    }
+
+    if (registry != NULL) {
+        sem_wait(&registry->mux);
+        for (int i = 0; i < MAX_USERS; i++) {
+            if (registry->online_users[i].is_active) {
+                pid_t pid = registry->online_users[i].handler_pid;
+                printf("[Cleanup] Killing handler for %s (PID: %d)\n", 
+                        registry->online_users[i].username, pid);
+                
+                kill(pid, SIGTERM);
+                waitpid(pid, NULL, 0);
+            }
+        }
+        sem_post(&registry->mux);
+    }
+
+    printf("[Cleanup] Removing Shared Memory and Semaphores...\n");
+    SharedMemCleanup(); 
+
+    if (server) {
+        close(server->sfd);
+        free(server);
+    }
+
+    printf("[Cleanup] Done. Safe to restart.\n");
 }
